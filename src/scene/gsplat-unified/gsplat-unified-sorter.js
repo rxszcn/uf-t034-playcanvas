@@ -11,6 +11,11 @@ import { GSplatSortBinWeights } from './gsplat-sort-bin-weights.js';
 /** @type {Set<number>} */
 const _neededIds = new Set();
 
+// Camera inputs below this delta are treated as unchanged. The sort keys quantize depth to 16-20
+// bits, so sub-epsilon camera motion cannot change any key anyway, and the stable tie-break order of
+// equal-key splats must not be re-rolled just because the per-frame matrix rebuild drifted a ulp.
+const SORT_INPUT_EPSILON = 1e-6;
+
 class GSplatUnifiedSorter extends EventHandler {
     worker;
 
@@ -23,6 +28,16 @@ class GSplatUnifiedSorter extends EventHandler {
 
     // true if we have new version to process
     hasNewVersion = false;
+
+    /**
+     * Camera inputs of the last dispatched sort, used to skip a redundant re-sort of a still scene.
+     * Null after a world-state change ({@link GSplatUnifiedSorter#setSortParameters}) or centers
+     * change, which always require a fresh sort.
+     *
+     * @type {{radialSorting: boolean, nearClip: number, logDepthKeys: boolean, params: object[]}|null}
+     * @private
+     */
+    _lastSortInputs = null;
 
     /**
      * Pending sorted result to be applied next frame. If multiple sorted results are received from
@@ -136,6 +151,10 @@ class GSplatUnifiedSorter extends EventHandler {
             if (!this.centersSet.has(id)) {
                 this.centersSet.add(id);
 
+                // the centers feed the distance keys, so a changed set invalidates the still-camera
+                // cache and forces the next sort
+                this._lastSortInputs = null;
+
                 // clone centers buffer - required when multiple workers sort the same splat resource
                 const centersBuffer = centers.buffer.slice();
 
@@ -151,6 +170,8 @@ class GSplatUnifiedSorter extends EventHandler {
 
             if (this.centersSet.has(id)) {
                 this.centersSet.delete(id);
+
+                this._lastSortInputs = null;
 
                 // post centers to worker
                 this.worker.postMessage({
@@ -200,6 +221,10 @@ class GSplatUnifiedSorter extends EventHandler {
         // we have a new version to process
         this.hasNewVersion = true;
 
+        // a new world state changes the index map and active splat set, so any cached still-camera
+        // result no longer applies
+        this._lastSortInputs = null;
+
         // output size matches input size, clear available data when it changes
         const { textureSize } = payload;
         const newLength = textureSize * textureSize;
@@ -212,6 +237,76 @@ class GSplatUnifiedSorter extends EventHandler {
     }
 
     /**
+     * Compares a sort request's camera inputs against those of the last dispatched sort. Returns
+     * true only when the sort mode and every per-placement direction, position and scalar are within
+     * {@link SORT_INPUT_EPSILON}; such a request would produce a bit-identical order, so re-sorting
+     * only risks re-rolling the stable tie-break of equal-key splats.
+     *
+     * @param {object[]} params - The per-placement sort parameters.
+     * @param {boolean} radialSorting - Whether radial distance sorting is used.
+     * @param {number} nearClip - The camera's near clip distance.
+     * @param {boolean} logDepthKeys - Whether directional keys are log spaced.
+     * @returns {boolean} True when the inputs are effectively unchanged.
+     * @private
+     */
+    _inputsUnchanged(params, radialSorting, nearClip, logDepthKeys) {
+        const prev = this._lastSortInputs ?? null;
+        if (!prev ||
+            prev.radialSorting !== radialSorting ||
+            prev.logDepthKeys !== logDepthKeys ||
+            prev.nearClip !== nearClip ||
+            prev.params.length !== params.length) {
+            return false;
+        }
+
+        for (let i = 0; i < params.length; i++) {
+            const a = params[i];
+            const b = prev.params[i];
+            const ad = a.transformedDirection;
+            const bd = b.transformedDirection;
+            const ap = a.transformedPosition;
+            const bp = b.transformedPosition;
+            if (Math.abs(ad.x - bd.x) > SORT_INPUT_EPSILON ||
+                Math.abs(ad.y - bd.y) > SORT_INPUT_EPSILON ||
+                Math.abs(ad.z - bd.z) > SORT_INPUT_EPSILON ||
+                Math.abs(ap.x - bp.x) > SORT_INPUT_EPSILON ||
+                Math.abs(ap.y - bp.y) > SORT_INPUT_EPSILON ||
+                Math.abs(ap.z - bp.z) > SORT_INPUT_EPSILON ||
+                Math.abs(a.offset - b.offset) > SORT_INPUT_EPSILON ||
+                Math.abs(a.scale - b.scale) > SORT_INPUT_EPSILON) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Caches a compact copy of the camera inputs a sort was dispatched with, for the next
+     * {@link GSplatUnifiedSorter#_inputsUnchanged}. AABBs and intervals change through
+     * {@link GSplatUnifiedSorter#setSortParameters} and invalidate the cache instead.
+     *
+     * @param {object[]} params - The per-placement sort parameters.
+     * @param {boolean} radialSorting - Whether radial distance sorting is used.
+     * @param {number} nearClip - The camera's near clip distance.
+     * @param {boolean} logDepthKeys - Whether directional keys are log spaced.
+     * @private
+     */
+    _cacheInputs(params, radialSorting, nearClip, logDepthKeys) {
+        this._lastSortInputs = {
+            radialSorting,
+            nearClip,
+            logDepthKeys,
+            params: params.map(p => ({
+                transformedDirection: { ...p.transformedDirection },
+                transformedPosition: { ...p.transformedPosition },
+                offset: p.offset,
+                scale: p.scale
+            }))
+        };
+    }
+
+    /**
      * Sends sorting parameters to the sorter. Called every frame sorting is needed.
      *
      * @param {object} params - The sorting parameters - per-splat directions, offsets, scales, AABBs.
@@ -221,37 +316,49 @@ class GSplatUnifiedSorter extends EventHandler {
      * @param {boolean} logDepthKeys - Whether a directional sort's keys are log spaced, which needs
      * a perspective, non-fisheye camera (radial sort keys always are).
      * @returns {boolean} True if a sort job was sent; false if one is in flight for this version,
-     * in which case the caller asks again later.
+     * in which case the caller asks again later, or the camera was still and the previous order
+     * stays in effect.
      */
     setSortParams(params, radialSorting, nearClip, logDepthKeys) {
 
-        // only process job requests if we have a new version or no jobs are in flight
-        if (this.hasNewVersion || this.jobsInFlight === 0) {
+        // Back-pressure takes priority: while a job of this version is in flight, turn the request
+        // away unchanged so the caller asks again when the worker is free.
+        if (!this.hasNewVersion && this.jobsInFlight > 0) {
+            return false;
+        }
 
-            // reuse or allocate new order data
-            let orderData = this.availableOrderData.pop();
-            if (!orderData) {
-                orderData = new Uint32Array(this.bufferLength);
-            }
-
-            // worker management
-            this.jobsInFlight++;
-            this.hasNewVersion = false;
-
-            // send job to worker
-            this.worker.postMessage({
-                command: 'sort',
-                sortParams: params,
-                radialSorting: radialSorting,
-                nearClip: nearClip,
-                logDepthKeys: logDepthKeys,
-                order: orderData.buffer
-            }, [
-                orderData.buffer
-            ]);
+        // A still scene re-sorts to a bit-identical order. Skip it rather than re-rolling the stable
+        // tie-break of equal-key splats (which shows up as on-demand frame jumps), and report the
+        // request as handled so the manager clears its sort flag. A new world state or centers change
+        // clears the cache and forces the sort.
+        if (!this.hasNewVersion && this._inputsUnchanged(params, radialSorting, nearClip, logDepthKeys)) {
             return true;
         }
-        return false;
+
+        // reuse or allocate new order data
+        let orderData = this.availableOrderData.pop();
+        if (!orderData) {
+            orderData = new Uint32Array(this.bufferLength);
+        }
+
+        // worker management
+        this.jobsInFlight++;
+        this.hasNewVersion = false;
+
+        this._cacheInputs(params, radialSorting, nearClip, logDepthKeys);
+
+        // send job to worker
+        this.worker.postMessage({
+            command: 'sort',
+            sortParams: params,
+            radialSorting: radialSorting,
+            nearClip: nearClip,
+            logDepthKeys: logDepthKeys,
+            order: orderData.buffer
+        }, [
+            orderData.buffer
+        ]);
+        return true;
     }
 }
 

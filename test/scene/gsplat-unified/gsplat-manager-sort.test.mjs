@@ -87,13 +87,15 @@ describe('GSplatManager#testCameraMovedForSort', function () {
 
 describe('GSplatUnifiedSorter#setSortParams', function () {
 
-    // A sorter whose worker only counts the jobs posted to it.
+    // A sorter whose worker only counts the sort jobs posted to it (interval payloads are separate).
     const makeSorter = () => {
         const sorter = Object.create(GSplatUnifiedSorter.prototype);
         sorter.posted = 0;
         sorter.worker = {
-            postMessage: () => {
-                sorter.posted++;
+            postMessage: (msg) => {
+                if (msg.command === 'sort') {
+                    sorter.posted++;
+                }
             }
         };
         sorter.bufferLength = 4;
@@ -111,9 +113,74 @@ describe('GSplatUnifiedSorter#setSortParams', function () {
         expect(sorter.setSortParams([], false, 0.1, true)).to.equal(false);
         expect(sorter.posted).to.equal(1);
 
-        // the job returned
+        // the job returned, but the camera inputs are unchanged: the still-camera gate handles the
+        // request without posting another job
         sorter.jobsInFlight = 0;
         expect(sorter.setSortParams([], false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(1);
+
+        // a camera change posts a fresh job
+        expect(sorter.setSortParams([], false, 0.2, true)).to.equal(true);
+        expect(sorter.posted).to.equal(2);
+    });
+
+    it('skips a redundant sort of a still camera and re-sorts once the inputs move beyond epsilon', function () {
+        const sorter = makeSorter();
+        const params = [{
+            transformedDirection: { x: 0, y: 0, z: 1 },
+            transformedPosition: { x: 0, y: 0, z: 0 },
+            offset: 0,
+            scale: 1
+        }];
+
+        // first sort runs and is cached
+        expect(sorter.setSortParams(params, false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(1);
+        sorter.jobsInFlight = 0;
+
+        // identical inputs: handled, but no worker job
+        expect(sorter.setSortParams(params, false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(1);
+
+        // a sub-epsilon drift is still treated as still
+        const tiny = [{
+            transformedDirection: { x: 0, y: 0, z: 1 + 1e-9 },
+            transformedPosition: { x: 0, y: 0, z: 0 },
+            offset: 0,
+            scale: 1
+        }];
+        expect(sorter.setSortParams(tiny, false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(1);
+
+        // a real movement forces a new job
+        const moved = [{
+            transformedDirection: { x: 0, y: 0, z: 1 },
+            transformedPosition: { x: 0, y: 0, z: 0 },
+            offset: 0.5,
+            scale: 1
+        }];
+        expect(sorter.setSortParams(moved, false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(2);
+    });
+
+    it('forces a sort after a new world state even when the camera is unchanged', function () {
+        const sorter = makeSorter();
+        const params = [{
+            transformedDirection: { x: 0, y: 0, z: 1 },
+            transformedPosition: { x: 0, y: 0, z: 0 },
+            offset: 0,
+            scale: 1
+        }];
+
+        expect(sorter.setSortParams(params, false, 0.1, true)).to.equal(true);
+        sorter.jobsInFlight = 0;
+        expect(sorter.setSortParams(params, false, 0.1, true)).to.equal(true);
+        expect(sorter.posted).to.equal(1);
+
+        // a new world state (new intervals payload) invalidates the still-camera cache and forces
+        // the next sort, even though the camera inputs are the same
+        sorter.setSortParameters({ textureSize: 2 });
+        expect(sorter.setSortParams(params, false, 0.1, true)).to.equal(true);
         expect(sorter.posted).to.equal(2);
     });
 });

@@ -4,7 +4,7 @@ import { Debug } from '../../core/debug.js';
 import { SEMANTIC_POSITION, CULLFACE_NONE } from '../../platform/graphics/constants.js';
 import {
     BLEND_NONE, BLEND_PREMULTIPLIED, BLEND_ADDITIVE, DITHER_BLUENOISE, DITHER_NONE,
-    GSPLAT_FORWARD, SHADOWCAMERA_NAME, ditherNames
+    GSPLAT_FORWARD, SHADOWCAMERA_NAME, ditherNames, RADIX_SORT_PORTABLE
 } from '../constants.js';
 import { ShaderMaterial } from '../materials/shader-material.js';
 import { GSplatResourceBase } from '../gsplat/gsplat-resource-base.js';
@@ -362,7 +362,22 @@ class GSplatHybridRenderer extends GSplatRenderer {
      * @private
      */
     _ensureGpuPipeline(needsSort) {
-        if (needsSort && !this.gpuSorter) this.gpuSorter = new ComputeRadixSort(this.device, { indirect: true });
+        if (needsSort && !this.gpuSorter) {
+            // The gsplat order is only defined up to equal sort keys: depth is quantized to 16-20
+            // bits, so neighbouring splats routinely share a key and their draw order comes from the
+            // radix sort's stability (pass 0 seeds the values with the input index). The OneSweep
+            // backend claims partition tiles with an atomic counter, so the workgroup that owns a
+            // given input range differs between frames and equal-key splats swap order frame to
+            // frame - a full-screen fine flicker on a still camera, and a different permutation on
+            // every on-demand render. The portable backend maps each workgroup to a fixed input
+            // range (WORKGROUP_ID * ELEMENTS_PER_WORKGROUP) and is genuinely stable, so pin it here
+            // even on NVIDIA where AUTO would pick OneSweep. The extra radix passes stay within the
+            // frame-time budget because the element count is the post-cull visible set.
+            this.gpuSorter = new ComputeRadixSort(this.device, {
+                indirect: true,
+                kind: RADIX_SORT_PORTABLE
+            });
+        }
         if (!this.projector) this.projector = new GSplatProjector(this.device);
         if (!this.intervalCompaction) this.intervalCompaction = new GSplatIntervalCompaction(this.device, this._scratch);
     }
